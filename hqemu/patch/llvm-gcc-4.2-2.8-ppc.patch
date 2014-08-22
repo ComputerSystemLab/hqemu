@@ -1,0 +1,19 @@
+diff -ruN old/configure new/configure
+--- old/configure	2010-04-14 02:38:28.000000000 +0800
++++ new/configure	2012-07-08 23:33:01.390849421 +0800
+@@ -933,14 +933,12 @@
+ 		target-libgloss \
+ 		target-newlib \
+ 		target-libstdc++-v3 \
+-		target-libmudflap \
+ 		target-libssp \
+ 		target-libgfortran \
+ 		target-boehm-gc \
+ 		${libgcj} \
+ 		target-libobjc \
+-		target-libada \
+-		target-libgomp"
++		target-libada"
+ 
+ # these tools are built using the target libraries, and are intended to
+ # run only in the target environment

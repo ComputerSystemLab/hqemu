@@ -1,0 +1,538 @@
+diff -ruN old/include/llvm/CodeGen/MachineFunction.h new/include/llvm/CodeGen/MachineFunction.h
+--- old/include/llvm/CodeGen/MachineFunction.h	2011-02-22 07:21:26.000000000 +0800
++++ new/include/llvm/CodeGen/MachineFunction.h	2013-04-16 21:46:44.083220426 +0800
+@@ -20,6 +20,7 @@
+ 
+ #include "llvm/CodeGen/MachineBasicBlock.h"
+ #include "llvm/ADT/ilist.h"
++#include "llvm/ADT/DenseMap.h"
+ #include "llvm/Support/DebugLoc.h"
+ #include "llvm/Support/Allocator.h"
+ #include "llvm/Support/Recycler.h"
+@@ -71,6 +72,12 @@
+   virtual ~MachineFunctionInfo();
+ };
+ 
++class EmittedCodeInfo {
++public:
++  DenseMap<uintptr_t, uintptr_t> ConstantPoolEntry;
++  DenseMap<uintptr_t, const char *> ExternalSymbol;
++};
++
+ class MachineFunction {
+   const Function *Fn;
+   const TargetMachine &Target;
+@@ -137,6 +144,9 @@
+   GCModuleInfo *getGMI() const { return GMI; }
+   MCContext &getContext() const { return Ctx; }
+   
++  /// Keep track of constant pools and external symbols for relocation.
++  EmittedCodeInfo ECInfo;
++
+   /// getFunction - Return the LLVM function that this machine code represents
+   ///
+   const Function *getFunction() const { return Fn; }
+diff -ruN old/include/llvm/Target/TargetRegisterInfo.h new/include/llvm/Target/TargetRegisterInfo.h
+--- old/include/llvm/Target/TargetRegisterInfo.h	2011-03-08 05:56:36.000000000 +0800
++++ new/include/llvm/Target/TargetRegisterInfo.h	2013-04-16 21:46:44.084220308 +0800
+@@ -295,6 +295,8 @@
+   virtual ~TargetRegisterInfo();
+ public:
+ 
++  std::vector<unsigned> ExtraReservedRegs;
++
+   // Register numbers can represent physical registers, virtual registers, and
+   // sometimes stack slots. The unsigned values are divided into these ranges:
+   //
+@@ -501,6 +503,13 @@
+   /// used by register scavenger to determine what registers are free.
+   virtual BitVector getReservedRegs(const MachineFunction &MF) const = 0;
+ 
++  /// getExtraReservedRegs - Add extra reserved registers to the reserved list.
++  virtual void getExtraReservedRegs(BitVector &Reserved,
++                  bool reset = true) const {}
++
++  virtual bool setExtraReservedRegs(std::string RegName) { return true; }
++  virtual void resetExtraReservedRegs() { ExtraReservedRegs.clear(); }
++
+   /// getSubReg - Returns the physical register number of sub-register "Index"
+   /// for physical register RegNo. Return zero if the sub-register does not
+   /// exist.
+diff -ruN old/lib/CodeGen/RegAllocLinearScan.cpp new/lib/CodeGen/RegAllocLinearScan.cpp
+--- old/lib/CodeGen/RegAllocLinearScan.cpp	2011-03-03 13:18:19.000000000 +0800
++++ new/lib/CodeGen/RegAllocLinearScan.cpp	2013-04-16 21:46:44.085220195 +0800
+@@ -140,6 +140,8 @@
+     const TargetInstrInfo* tii_;
+     BitVector allocatableRegs_;
+     BitVector reservedRegs_;
++    BitVector extraReservedRegs_;
++    DenseMap<LiveInterval*, unsigned> moveReservedRegs_;
+     LiveIntervals* li_;
+     MachineLoopInfo *loopInfo;
+ 
+@@ -189,6 +191,8 @@
+       }
+     }
+ 
++    void moveReservedRegs();
++
+   public:
+     virtual const char* getPassName() const {
+       return "Linear Scan Register Allocator";
+@@ -330,7 +334,7 @@
+     bool isRegAvail(unsigned physReg) const {
+       assert(TargetRegisterInfo::isPhysicalRegister(physReg) &&
+              "should be physical register!");
+-      return regUse_[physReg] == 0;
++      return regUse_[physReg] == 0 && reservedRegs_.test(physReg) == false;
+     }
+ 
+     void backUpRegUses() {
+@@ -505,6 +509,13 @@
+   return CandReg;
+ }
+ 
++void RALinScan::moveReservedRegs() {
++  for (DenseMap<LiveInterval*,unsigned>::iterator
++                  I = moveReservedRegs_.begin(), E = moveReservedRegs_.end();
++                  I != E; I++)
++    vrm_->assignVirt2Phys(I->first->reg, I->second);
++}
++
+ bool RALinScan::runOnMachineFunction(MachineFunction &fn) {
+   mf_ = &fn;
+   mri_ = &fn.getRegInfo();
+@@ -516,6 +527,9 @@
+   li_ = &getAnalysis<LiveIntervals>();
+   loopInfo = &getAnalysis<MachineLoopInfo>();
+ 
++  tri_->getExtraReservedRegs(extraReservedRegs_);
++  moveReservedRegs_.clear();
++
+   // We don't run the coalescer here because we have no reason to
+   // interact with it.  If the coalescer requires interaction, it
+   // won't do anything.  If it doesn't require interaction, we assume
+@@ -537,6 +551,8 @@
+ 
+   linearScan();
+ 
++  moveReservedRegs();
++
+   // Rewrite spill code and update the PhysRegsUsed set.
+   rewriter_->runOnMachineFunction(*mf_, *vrm_, li_);
+ 
+@@ -1005,6 +1021,11 @@
+         else if (vrm_->isAssignedReg(SrcReg))
+           Reg = vrm_->getPhys(SrcReg);
+         if (Reg) {
++          if (extraReservedRegs_[Reg]) {
++            moveReservedRegs_[cur] = Reg;
++            restoreRegUses();
++            return;
++          }
+           if (SrcSubReg)
+             Reg = tri_->getSubReg(Reg, SrcSubReg);
+           if (DstSubReg)
+diff -ruN old/lib/CodeGen/SelectionDAG/DAGCombiner.cpp new/lib/CodeGen/SelectionDAG/DAGCombiner.cpp
+--- old/lib/CodeGen/SelectionDAG/DAGCombiner.cpp	2011-03-03 03:36:30.000000000 +0800
++++ new/lib/CodeGen/SelectionDAG/DAGCombiner.cpp	2013-04-16 21:46:44.089219774 +0800
+@@ -53,6 +53,10 @@
+     CombinerGlobalAA("combiner-global-alias-analysis", cl::Hidden,
+                cl::desc("Include global information in alias analysis"));
+ 
++  static cl::opt<bool>
++    DisablePrePostIndex("disable-prepost-index", cl::Hidden,
++               cl::desc("Disable pre/post indexed load and store"));
++
+ //------------------------------ DAGCombiner ---------------------------------//
+ 
+   class DAGCombiner {
+@@ -5546,6 +5550,8 @@
+ /// the add / subtract in and all of its other uses are redirected to the
+ /// new load / store.
+ bool DAGCombiner::CombineToPreIndexedLoadStore(SDNode *N) {
++  if (DisablePrePostIndex)
++    return false;
+   if (!LegalOperations)
+     return false;
+ 
+@@ -5673,6 +5679,8 @@
+ /// load / store effectively and all of its uses are redirected to the
+ /// new load / store.
+ bool DAGCombiner::CombineToPostIndexedLoadStore(SDNode *N) {
++  if (DisablePrePostIndex)
++    return false;
+   if (!LegalOperations)
+     return false;
+ 
+diff -ruN old/lib/CodeGen/SelectionDAG/LegalizeDAG.cpp new/lib/CodeGen/SelectionDAG/LegalizeDAG.cpp
+--- old/lib/CodeGen/SelectionDAG/LegalizeDAG.cpp	2011-03-08 02:29:47.000000000 +0800
++++ new/lib/CodeGen/SelectionDAG/LegalizeDAG.cpp	2013-04-16 21:46:44.091219575 +0800
+@@ -1026,7 +1026,7 @@
+     }
+     break;
+   case ISD::CALLSEQ_START: {
+-    static int depth = 0;
++    static __thread int depth = 0;
+     SDNode *CallEnd = FindCallEndFromCallStart(Node);
+ 
+     // Recursively Legalize all of the inputs of the call end that do not lead
+diff -ruN old/lib/CodeGen/SelectionDAG/TargetLowering.cpp new/lib/CodeGen/SelectionDAG/TargetLowering.cpp
+--- old/lib/CodeGen/SelectionDAG/TargetLowering.cpp	2011-02-26 05:41:48.000000000 +0800
++++ new/lib/CodeGen/SelectionDAG/TargetLowering.cpp	2013-04-16 21:46:44.093219380 +0800
+@@ -2191,6 +2191,8 @@
+         N0.getOpcode() == ISD::AND)
+       if (ConstantSDNode *AndRHS =
+                   dyn_cast<ConstantSDNode>(N0.getOperand(1))) {
++        return SDValue();
++#if 0
+         EVT ShiftTy = DCI.isBeforeLegalize() ?
+           getPointerTy() : getShiftAmountTy(N0.getValueType());
+         if (Cond == ISD::SETNE && C1 == 0) {// (X & 8) != 0  -->  (X & 8) >> 3
+@@ -2209,6 +2211,7 @@
+                                       DAG.getConstant(C1.logBase2(), ShiftTy)));
+           }
+         }
++#endif
+       }
+   }
+ 
+diff -ruN old/lib/Target/ARM/ARMBaseInstrInfo.cpp new/lib/Target/ARM/ARMBaseInstrInfo.cpp
+--- old/lib/Target/ARM/ARMBaseInstrInfo.cpp	2011-03-24 15:56:16.000000000 +0800
++++ new/lib/Target/ARM/ARMBaseInstrInfo.cpp	2013-04-16 21:46:44.094219285 +0800
+@@ -1625,8 +1625,7 @@
+   case ARM::t2ADDri:
+   case ARM::t2SUBri:
+     // Toggle the optional operand to CPSR.
+-    MI->getOperand(5).setReg(ARM::CPSR);
+-    MI->getOperand(5).setIsDef(true);
++    MI->addOperand(MachineOperand::CreateReg(ARM::CPSR, true, true));
+     CmpInstr->eraseFromParent();
+     return true;
+   }
+diff -ruN old/lib/Target/ARM/ARMBaseRegisterInfo.cpp new/lib/Target/ARM/ARMBaseRegisterInfo.cpp
+--- old/lib/Target/ARM/ARMBaseRegisterInfo.cpp	2011-03-08 05:56:36.000000000 +0800
++++ new/lib/Target/ARM/ARMBaseRegisterInfo.cpp	2013-04-16 21:46:44.095219191 +0800
+@@ -100,9 +100,47 @@
+   // Some targets reserve R9.
+   if (STI.isR9Reserved())
+     Reserved.set(ARM::R9);
++  getExtraReservedRegs(Reserved, false);
+   return Reserved;
+ }
+ 
++void ARMBaseRegisterInfo::getExtraReservedRegs(BitVector &Reserved,
++                bool reset) const {
++  if (reset == true)
++    Reserved = BitVector(getNumRegs());
++  for (int i = 0, e = ExtraReservedRegs.size(); i < e; i++)
++    Reserved.set(ExtraReservedRegs[i]);
++}
++
++bool ARMBaseRegisterInfo::setExtraReservedRegs(std::string RegName) {
++#define RESERVE(x) \
++  do { \
++    ExtraReservedRegs.push_back(ARM::R ## x); \
++    return true; \
++  } while(0)
++
++  if (RegName == "r0")  RESERVE(0);
++  if (RegName == "r1")  RESERVE(1);
++  if (RegName == "r2")  RESERVE(2);
++  if (RegName == "r3")  RESERVE(3);
++  if (RegName == "r4")  RESERVE(4);
++  if (RegName == "r5")  RESERVE(5);
++  if (RegName == "r6")  RESERVE(6);
++  if (RegName == "r7")  RESERVE(7);
++  if (RegName == "r8")  RESERVE(8);
++  if (RegName == "r9")  RESERVE(9);
++  if (RegName == "r10") RESERVE(10);
++  if (RegName == "r11") RESERVE(11);
++  if (RegName == "r12") RESERVE(12);
++  return false;
++
++#undef RESERVE
++}
++
++void ARMBaseRegisterInfo::resetExtraReservedRegs() {
++  ExtraReservedRegs.clear();
++}
++
+ bool ARMBaseRegisterInfo::isReservedReg(const MachineFunction &MF,
+                                         unsigned Reg) const {
+   const TargetFrameLowering *TFI = MF.getTarget().getFrameLowering();
+diff -ruN old/lib/Target/ARM/ARMBaseRegisterInfo.h new/lib/Target/ARM/ARMBaseRegisterInfo.h
+--- old/lib/Target/ARM/ARMBaseRegisterInfo.h	2011-03-08 05:56:36.000000000 +0800
++++ new/lib/Target/ARM/ARMBaseRegisterInfo.h	2013-04-16 21:46:44.095219191 +0800
+@@ -109,6 +109,10 @@
+ 
+   BitVector getReservedRegs(const MachineFunction &MF) const;
+ 
++  void getExtraReservedRegs(BitVector &Reserved, bool reset = true) const;
++  bool setExtraReservedRegs(std::string RegName);
++  void resetExtraReservedRegs();
++
+   /// getMatchingSuperRegClass - Return a subclass of the specified register
+   /// class A so that each register in it has a sub-register of the
+   /// specified sub-register index which is in the specified register class B.
+diff -ruN old/lib/Target/ARM/ARMCodeEmitter.cpp new/lib/Target/ARM/ARMCodeEmitter.cpp
+--- old/lib/Target/ARM/ARMCodeEmitter.cpp	2011-03-08 07:38:41.000000000 +0800
++++ new/lib/Target/ARM/ARMCodeEmitter.cpp	2013-04-16 21:46:44.096219100 +0800
+@@ -56,6 +56,7 @@
+     const std::vector<MachineJumpTableEntry> *MJTEs;
+     bool IsPIC;
+     bool IsThumb;
++    EmittedCodeInfo *ECInfo;
+ 
+     void getAnalysisUsage(AnalysisUsage &AU) const {
+       AU.addRequired<MachineModuleInfo>();
+@@ -369,6 +370,7 @@
+   JTI->Initialize(MF, IsPIC);
+   MMI = &getAnalysis<MachineModuleInfo>();
+   MCE.setModuleInfo(MMI);
++  ECInfo = &MF.ECInfo;
+ 
+   do {
+     DEBUG(errs() << "JITTing function '"
+@@ -473,7 +475,7 @@
+ void ARMCodeEmitter::
+ emitExternalSymbolAddress(const char *ES, unsigned Reloc) const {
+   MCE.addRelocation(MachineRelocation::getExtSym(MCE.getCurrentPCOffset(),
+-                                                 Reloc, ES));
++                                                 Reloc, ES, 0, 0, false));
+ }
+ 
+ /// emitConstPoolAddress - Arrange for the address of an constant pool
+@@ -631,11 +633,15 @@
+     if (GV) {
+       Reloc::Model RelocM = TM.getRelocationModel();
+       emitGlobalAddress(GV, ARM::reloc_arm_machine_cp_entry,
++#if 0
+                         isa<Function>(GV),
++#endif
++                        false,
+                         Subtarget->GVIsIndirectSymbol(GV, RelocM),
+                         (intptr_t)ACPV);
+      } else  {
+       emitExternalSymbolAddress(ACPV->getSymbol(), ARM::reloc_arm_absolute);
++      ECInfo->ExternalSymbol[MCE.getCurrentPCOffset()] = ACPV->getSymbol();
+     }
+     emitWordLE(0);
+   } else {
+@@ -1018,7 +1024,7 @@
+       Binary |= ((Lo16 >> 12) & 0xF) << 16;
+       emitWordLE(Binary);
+       return;
+-  } else if(TID.Opcode == ARM::MOVTi16) {
++  } else if(TID.Opcode == ARM::MOVTi16 && MI.getOperand(OpIdx).isReg() == false) {
+       unsigned Hi16 = (getMovi32Value(MI, MI.getOperand(OpIdx),
+                        ARM::reloc_arm_movt) >> 16);
+       Binary |= Hi16 & 0xFFF;
+@@ -1096,7 +1102,8 @@
+ 
+   // If this is an LDRi12, STRi12 or LDRcp, nothing more needs be done.
+   if (MI.getOpcode() == ARM::LDRi12 || MI.getOpcode() == ARM::LDRcp ||
+-      MI.getOpcode() == ARM::STRi12) {
++      MI.getOpcode() == ARM::STRi12 || MI.getOpcode() == ARM::LDRBi12 || 
++      MI.getOpcode() == ARM::STRBi12) {
+     emitWordLE(Binary);
+     return;
+   }
+diff -ruN old/lib/Target/ARM/ARMJITInfo.cpp new/lib/Target/ARM/ARMJITInfo.cpp
+--- old/lib/Target/ARM/ARMJITInfo.cpp	2011-02-03 01:29:40.000000000 +0800
++++ new/lib/Target/ARM/ARMJITInfo.cpp	2013-04-16 21:46:44.097219010 +0800
+@@ -255,6 +255,8 @@
+     assert((!ACPV->hasModifier() && !ACPV->mustAddCurrentAddress()) &&
+            "Can't handle this machine constant pool entry yet!");
+     intptr_t Addr = (intptr_t)(MR->getResultPointer());
++    if (ACPV->isGlobalValue() && isa<Function>(ACPV->getGV()))
++      return Addr;
+     Addr -= getPCLabelAddr(ACPV->getLabelId()) + ACPV->getPCAdjustment();
+     return Addr;
+   }
+diff -ruN old/lib/Target/ARM/ARMTargetMachine.cpp new/lib/Target/ARM/ARMTargetMachine.cpp
+--- old/lib/Target/ARM/ARMTargetMachine.cpp	2011-02-17 20:24:17.000000000 +0800
++++ new/lib/Target/ARM/ARMTargetMachine.cpp	2013-04-16 21:46:44.097219010 +0800
+@@ -23,6 +23,8 @@
+ using namespace llvm;
+ 
+ static cl::opt<bool>ExpandMLx("expand-fp-mlx", cl::init(false), cl::Hidden);
++static cl::opt<bool>DisableExpandPseudo("disable-expand-pseudo", cl::Hidden,
++                cl::desc("Disable expanding pseudo instructions"));
+ 
+ static MCAsmInfo *createMCAsmInfo(const Target &T, StringRef TT) {
+   Triple TheTriple(TT);
+@@ -168,7 +170,8 @@
+ 
+   // Expand some pseudo instructions into multiple instructions to allow
+   // proper scheduling.
+-  PM.add(createARMExpandPseudoPass());
++  if (!DisableExpandPseudo)
++    PM.add(createARMExpandPseudoPass());
+ 
+   if (OptLevel != CodeGenOpt::None) {
+     if (!Subtarget.isThumb1Only())
+diff -ruN old/lib/Target/X86/X86CodeEmitter.cpp new/lib/Target/X86/X86CodeEmitter.cpp
+--- old/lib/Target/X86/X86CodeEmitter.cpp	2010-10-09 07:59:27.000000000 +0800
++++ new/lib/Target/X86/X86CodeEmitter.cpp	2013-04-16 21:47:37.289213890 +0800
+@@ -50,6 +50,7 @@
+     intptr_t PICBaseOffset;
+     bool Is64BitMode;
+     bool IsPIC;
++    EmittedCodeInfo *ECInfo;
+   public:
+     static char ID;
+     explicit Emitter(X86TargetMachine &tm, CodeEmitter &mce)
+@@ -122,6 +123,7 @@
+   TD = TM.getTargetData();
+   Is64BitMode = TM.getSubtarget<X86Subtarget>().is64Bit();
+   IsPIC = TM.getRelocationModel() == Reloc::PIC_;
++  ECInfo = &MF.ECInfo;
+   
+   do {
+     DEBUG(dbgs() << "JITTing function '" 
+@@ -618,6 +620,17 @@
+   MCE.processDebugLoc(MI.getDebugLoc(), true);
+ 
+   unsigned Opcode = Desc->Opcode;
++  uintptr_t CurrentPC = MCE.getCurrentPCValue();
++
++  // Emit four ud2 for HQEMU.
++  if (Opcode == X86::TRAP) {
++    for (unsigned i = 0; i < 4; i++) {
++      MCE.emitByte(0x0F);
++      MCE.emitByte(0x0B);
++    }
++    MCE.processDebugLoc(MI.getDebugLoc(), false);
++    return;
++  }
+ 
+   // Emit the lock opcode prefix as needed.
+   if (Desc->TSFlags & X86II::LOCK)
+@@ -826,8 +839,11 @@
+                         Indirect);
+     } else if (MO1.isSymbol())
+       emitExternalSymbolAddress(MO1.getSymbolName(), rt);
+-    else if (MO1.isCPI())
++    else if (MO1.isCPI()) {
+       emitConstPoolAddress(MO1.getIndex(), rt);
++      ECInfo->ConstantPoolEntry[CurrentPC] =
++              MCE.getConstantPoolEntryAddress(MO1.getIndex());
++    }
+     else if (MO1.isJTI())
+       emitJumpTableAddress(MO1.getIndex(), rt);
+     break;
+diff -ruN old/lib/Target/X86/X86RegisterInfo.cpp new/lib/Target/X86/X86RegisterInfo.cpp
+--- old/lib/Target/X86/X86RegisterInfo.cpp	2011-03-08 05:56:36.000000000 +0800
++++ new/lib/Target/X86/X86RegisterInfo.cpp	2013-04-16 21:46:44.099218833 +0800
+@@ -446,9 +446,66 @@
+   Reserved.set(X86::ST5);
+   Reserved.set(X86::ST6);
+   Reserved.set(X86::ST7);
++  getExtraReservedRegs(Reserved, false);
+   return Reserved;
+ }
+ 
++void X86RegisterInfo::getExtraReservedRegs(BitVector &Reserved,
++                bool reset) const {
++  if (reset == true)
++    Reserved = BitVector(getNumRegs());
++  for (int i = 0, e = ExtraReservedRegs.size(); i < e; i++)
++    Reserved.set(ExtraReservedRegs[i]);
++}
++
++bool X86RegisterInfo::setExtraReservedRegs(std::string RegName) {
++#define RESERVE1(x) \
++  do { \
++    ExtraReservedRegs.push_back(X86::x ## L); \
++    ExtraReservedRegs.push_back(X86::x ## H); \
++    ExtraReservedRegs.push_back(X86::x ## X);\
++    ExtraReservedRegs.push_back(X86::E ## x ## X);\
++    ExtraReservedRegs.push_back(X86::R ## x ## X);\
++    return true; \
++  } while(0)
++
++#define RESERVE2(x) \
++  do { \
++    ExtraReservedRegs.push_back(X86::R ## x); \
++    ExtraReservedRegs.push_back(X86::R ## x ## B);\
++    ExtraReservedRegs.push_back(X86::R ## x ## D);\
++    ExtraReservedRegs.push_back(X86::R ## x ## W);\
++    return true; \
++  } while(0)
++
++  if (RegName == "ebp") {
++    ExtraReservedRegs.push_back(X86::EBP);
++    return true;
++  }
++#if defined(__x86_64__)
++  if (RegName == "rax") RESERVE1(A);
++  if (RegName == "rbx") RESERVE1(B);
++  if (RegName == "rcx") RESERVE1(C);
++  if (RegName == "rdx") RESERVE1(D);
++  if (RegName == "r8")  RESERVE2(8);
++  if (RegName == "r9")  RESERVE2(9);
++  if (RegName == "r10") RESERVE2(10);
++  if (RegName == "r11") RESERVE2(11);
++  if (RegName == "r12") RESERVE2(12);
++  if (RegName == "r13") RESERVE2(13);
++  if (RegName == "r14") RESERVE2(14);
++  if (RegName == "r15") RESERVE2(15);
++#endif
++  return false;
++
++#undef RESERVE1
++#undef RESERVE2
++}
++
++void X86RegisterInfo::resetExtraReservedRegs() {
++  ExtraReservedRegs.clear();
++}
++
+ //===----------------------------------------------------------------------===//
+ // Stack Frame Processing methods
+ //===----------------------------------------------------------------------===//
+diff -ruN old/lib/Target/X86/X86RegisterInfo.h new/lib/Target/X86/X86RegisterInfo.h
+--- old/lib/Target/X86/X86RegisterInfo.h	2011-03-08 05:56:36.000000000 +0800
++++ new/lib/Target/X86/X86RegisterInfo.h	2013-04-16 21:46:44.099218833 +0800
+@@ -114,6 +114,10 @@
+   /// register scavenger to determine what registers are free.
+   BitVector getReservedRegs(const MachineFunction &MF) const;
+ 
++  void getExtraReservedRegs(BitVector &Reserved, bool reset = true) const;
++  bool setExtraReservedRegs(std::string RegName);
++  void resetExtraReservedRegs();
++
+   bool canRealignStack(const MachineFunction &MF) const;
+ 
+   bool needsStackRealignment(const MachineFunction &MF) const;
+diff -ruN old/lib/Transforms/InstCombine/InstCombineCasts.cpp new/lib/Transforms/InstCombine/InstCombineCasts.cpp
+--- old/lib/Transforms/InstCombine/InstCombineCasts.cpp	2011-02-15 08:14:00.000000000 +0800
++++ new/lib/Transforms/InstCombine/InstCombineCasts.cpp	2013-04-16 21:46:44.100218746 +0800
+@@ -14,9 +14,13 @@
+ #include "InstCombine.h"
+ #include "llvm/Target/TargetData.h"
+ #include "llvm/Support/PatternMatch.h"
++#include "llvm/Support/CommandLine.h"
+ using namespace llvm;
+ using namespace PatternMatch;
+ 
++static cl::opt<bool> DisableBCVector("disable-bc-vector", cl::Hidden,
++    cl::desc("Disable bitcast to/from VectorType"));
++
+ /// DecomposeSimpleLinearExpr - Analyze 'Val', seeing if it is a simple linear
+ /// expression.  If so, decompose it, returning some value X, such that Val is
+ /// X*Scale+Offset.
+@@ -1640,6 +1644,12 @@
+     if (Instruction *I = OptimizeIntToFloatBitCast(CI, *this))
+       return I;
+ 
++  if (DisableBCVector == true) {
++    if (SrcTy->isPointerTy())
++      return commonPointerCastTransforms(CI);
++    return commonCastTransforms(CI);
++  }
++
+   if (const VectorType *DestVTy = dyn_cast<VectorType>(DestTy)) {
+     if (DestVTy->getNumElements() == 1 && !SrcTy->isVectorTy()) {
+       Value *Elem = Builder->CreateBitCast(Src, DestVTy->getElementType());
