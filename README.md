@@ -1,4 +1,4 @@
 HQEMU
 =====
 
-An efficient and retargetable dynamic binary translator on multicores
+The official HQEMU website is now at http://itanium.iis.sinica.edu.tw/hqemu/
